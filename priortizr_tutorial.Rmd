@@ -39,7 +39,8 @@ print(tas_pu)
 
 ```{r}
 # plot map of planning unit costs
-plot(st_as_sf(tas_pu[, "cost"]), main = "Planning unit costs")
+plot(st_as
+     _sf(tas_pu[, "cost"]), main = "Planning unit costs")
 ```
 
 ```{r}
@@ -47,7 +48,7 @@ plot(st_as_sf(tas_pu[, "cost"]), main = "Planning unit costs")
 plot(st_as_sf(tas_pu[, "locked_in"]), main = "Protected area coverage")
 ```
 
-The `tas_features` object describes the spatial distribution of the features. These data are expressed as a stack of 62 rasters, each layer in the stack corresponding to one of 62 different vegetation communities. Each layer contains a spatially references grid of rectangular cells, which have information on the distribution of the given vegetation community. Specifically, these grid cells are assigned a value of 1 if the vegetation community is present and a value of 0 if absent. 
+The `tas_features` object describes the spatial distribution of the features. These data are expressed as a stack of 62 rasters, each layer in the stack corresponding to one of 62 different vegetation communities. Each layer contains a spatially referenced grid of rectangular cells, which have information on the distribution of the given vegetation community. Specifically, these grid cells are assigned a value of 1 if the vegetation community is present and a value of 0 if absent. 
 
 First we plot the first four features as an example. Pixel values denote the presence or absence of each feature within the extent of the study area. 
 
@@ -104,8 +105,221 @@ plot(st_as_sf(s1[, "solution_1"]), main = "Prioritization",
 ```
 
 
+## Feature representation
+
+How well are the vegetation communities represented by existing protected areas and the prioritization?
+
+```{r}
+# create column with existing protected areas
+tas_pu$pa <- round(tas_pu$locked_in)
+
+# calculate feature representation statistics based on existing protected areas
+tc_pa <- eval_target_coverage_summary(p1, tas_pu[, "pa"])
+print(tc_pa)
+```
+
+```{r}
+# calculate feature representation statistics based on the prioritization
+tc_s1 <- eval_target_coverage_summary(p1, s1[, "solution_1"])
+print(tc_s1)
+```
+
+```{r}
+# explore representation by existing protected areas
+## calculate number of features adequately represented by existing protected
+## areas
+sum(tc_pa$met)
+```
+
+```{r}
+## summarize representation (values show percent coverage)
+summary(tc_pa$relative_held * 100)
+```
+
+```{r}
+## visualize representation  (values show percent coverage)
+hist(tc_pa$relative_held * 100,
+     main = "Feature representation by existing protected areas",
+     xlim = c(0, 100),
+     xlab = "Percent coverage of features (%)")
+```
+
+```{r}
+# explore representation by prioritization
+## summarize representation (values show percent coverage)
+summary(tc_s1$relative_held * 100)
+```
+
+```{r}
+## calculate number of features adequately represented by the prioritization
+sum(tc_s1$met)
+```
+
+```{r}
+## visualize representation  (values show percent coverage)
+hist(tc_s1$relative_held * 100,
+     main = "Feature representation by prioritization",
+     xlim = c(0, 100),
+     xlab = "Percent coverage of features (%)")
+```
+
+We can see that representation of the vegetation communities by existing protected areas is remarkably poor. For example, many of the vegetation communities have nearly zero coverage by existing protected areas. In other words, are almost entirely absent from existing protected areas. We can also see that all vegetation communities have at least 17% coverage by the prioritization – meaning that it meets the representation targets for all of the features.
 
 
+
+## Irreplaceability
+
+After generating the prioritization, we can examine the relative importance of planning units selected by the prioritization. This can be useful to identify critically important planning units for conservation – in other words, places that contain biodiversity features which cannot be represented anywhere else – and schedule implementation of the prioritization. To achieve this, we will use the Ferrier metric (Ferrier et al. 2000).
+
+```{r}
+# calculate irreplaceability
+irrep_s1 <- eval_ferrier_importance(p1, s1["solution_1"])
+print(irrep_s1)
+```
+
+```{r}
+# manually coerce values for planning units not selected in prioritization to NA, so that they are shown in white
+irrep_s1$plot_total <- irrep_s1$total
+#coerce NA into real value
+irrep_s1$plot_total[s1$solution_1 < 0.5] <- NA_real_
+
+# now plot map of overall importance scores
+plot(st_as_sf(irrep_s1[, "plot_total"]), main = "Overall importance")
+
+```
+
+
+
+## Portfolios
+
+Conservation planning exercises often involve generating multiple different prioritizations. This can help decision makers consider different options, and provide starting points for building consensus among stakeholders. To generate a range of different prioritizations given the same problem formulation, we can use portfolio functions. Here we will use the gap portfolio to generate 1000 solutions that are within 30% of optimality. Please note that you will need to have the Gurobi solver installed to use this specific portfolio. If you don’t have access to Gurobi, you could try using the shuffle portfolio instead (using the `add_shuffle_portfolio()` function).
+
+```{r}
+# create new problem with a portfolio added to it
+p2 <- p1 %>% 
+  add_gap_portfolio(number_solutions = 1000, pool_gap = 0.2)
+
+# print problem
+print(p2)
+```
+
+```{r}
+# generate prioritizations. This will take a while to run!
+prt <- solve(p2)
+```
+
+```{r}
+print(prt)
+```
+
+After generating all these prioritizations, we now want some way to visualize them. Because it would be onerous to look at each and every prioritization individually, we will use statistical analyses to help us. We can visualize the differences between these different prioritizations – based on which planning units they selected – using a hierarchical cluster analysis (Harris et al. 2014).
+
+```{r}
+# extract solutions
+prt_results <- prt@data[, startsWith(names(prt), "solution_"), ]
+
+# calculate pair-wise distances between different prioritizations for analysis
+prt_dists <- vegan::vegdist(t(prt_results), method = "jaccard", binary = TRUE)
+
+# run cluster analysis
+prt_clust <- hclust(as.dist(prt_dists), method = "average")
+
+# visualize clusters
+opar <- par()
+par(oma = c(0, 0, 0, 0), mar= c(0, 4.1, 1.5, 2.1))
+plot(prt_clust, labels = FALSE, sub = NA, xlab = "",
+     main = "Different prioritizations in portfolio")
+suppressWarnings(par(opar))
+```
+
+We can see that there are approximately six main groups of prioritizations in the portfolio. To explore these different groups, let’s conduct another cluster analysis (i.e., a k-medoids analysis) to extract the most representative prioritization from each of these groups. In other words, we will run another statistical analysis to find the most central prioritization within each group.
+
+
+```{r}
+# run k-medoids analysis
+prt_med <- pam(prt_dists, k = 6)
+
+# extract names of prioritizations that are most central for each group.
+prt_med_names <- prt_med$medoids
+print(prt_med_names)
+```
+
+
+```{r}
+# create a copy of prt and set values for locked in planning units to -1
+# so we can easily visualize differences between prioritizations
+prt2 <- prt[, prt_med_names]
+prt2@data[which(tas_pu$locked_in > 0.5), prt_med_names] <- -1
+
+# plot a map showing main different prioritizations
+# dark grey: locked in planning units
+# grey: planning units not selected
+# green: selected planning units
+plot(st_as_sf(prt2), pal = c("grey60", "grey90", "darkgreen"))
+```
+
+
+
+## Marxan compatibility
+
+The prioritizr R package provides functionality to help Marxan users generate prioritizations. Specifically, it can import conservation planning data prepared for Marxan, and can generate prioritizations using a similar problem formulation as Marxan (based on Beyer et al. 2016). Indeed, the problem formulation presented earlier in this vignette is very similar to that used by Marxan. The key difference is that the problem formulation we specified earlier uses “hard constraints” for feature representation, and Marxan uses “soft constraints” for feature representation. This means that prioritization we generated earlier was mathematically guaranteed to reach the targets for all features. However, if we used Marxan to generate the prioritization, then we could have produced a prioritization that would fail to reach targets (depending the Species Penalty Factors used to generate the prioritization). In addition to these differences in terms problem formulation, the prioritizr R package uses exact algorithms – instead of the simulated annealing algorithm – which ensures that we obtain prioritizations that are near optimal.
+
+Here we will show the prioritizr R package can import Marxan data and generate a prioritization. To begin with, let’s import a conservation planning data prepared for Marxan.
+
+```{r}
+# import data
+## planning unit data
+pu_path <- system.file("extdata/input/pu.dat", package = "prioritizr")
+pu_data <- read.csv(pu_path, header = TRUE, stringsAsFactors = FALSE)
+print(head(pu_data))
+```
+
+```{r}
+## feature data
+spec_path <- system.file("extdata/input/spec.dat", package = "prioritizr")
+spec_data <- read.csv(spec_path, header = TRUE, stringsAsFactors = FALSE)
+print(head(spec_data))
+```
+
+```{r}
+## amount of each feature within each planning unit data
+puvspr_path <- system.file("extdata/input/puvspr.dat", package = "prioritizr")
+puvspr_data <- read.csv(puvspr_path, header = TRUE, stringsAsFactors = FALSE)
+print(head(puvspr_data))
+```
+
+```{r}
+## boundary data
+bound_path <- system.file("extdata/input/bound.dat", package = "prioritizr")
+bound_data <- read.table(bound_path, header = TRUE, stringsAsFactors = FALSE)
+print(head(bound_data))
+```
+
+After importing the data, we can now generate a prioritization based on the Marxan problem formulation (using the `marxan_problem()` function). Please note that this function does not generate prioritizations using Marxan. Instead, it uses the data to create an optimization problem formulation similar to Marxan – using hard constraints instead of soft constraints – and uses an exact algorithm solver to generate a prioritization.
+
+```{r}
+# create problem
+p2 <- marxan_problem(pu_data, spec_data, puvspr_data, bound_data,
+                     blm = 0.0005)
+
+# print problem
+print(p2)
+```
+
+```{r}
+# solve problem
+s2 <- solve(p2)
+```
+
+```{r}
+#print first six rows of solution object
+print(head(s2))
+```
+
+
+## Conclusion
+
+This tutorial shows how the prioritizr R package can be used to build a conservation problem, generate a prioritization, and evaluate it. Although we explored just a few functions, the package provides many different functions so that you can build and custom-tailor conservation planning problems to suit your needs. To learn more about the package, please see the package vignettes for an overview of the package, instructions for installing the Gurobi optimization suite, benchmarks comparing the performance of different solvers, and a record of publications that have cited the package. In addition to this tutorial, the package also provides tutorials on incorporating connectivity into prioritizations, calibrating trade-offs between different criteria (e.g., total cost and spatial fragmentation), and creating prioritizations that have multiple management zones or management actions.
 
 
 
